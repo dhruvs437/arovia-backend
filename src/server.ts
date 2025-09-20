@@ -14,7 +14,11 @@ import { authMiddleware } from './utils/jwt';
 
 const app = express();
 app.use(bodyParser.json());
-app.use(cors({ origin: ['http://localhost:3000'], credentials: true }));
+app.use(cors({
+  origin: "*",           // allow requests from any origin
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
 
 // routes
 app.use('/api/auth', authRoutes);
