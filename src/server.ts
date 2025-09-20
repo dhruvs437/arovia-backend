@@ -1,7 +1,9 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import bodyParser from 'body-parser';
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
 import cors from 'cors';
 import 'express-async-errors';
 import authRoutes from './routes/auth';
@@ -9,7 +11,6 @@ import healthRoutes from './routes/health';
 import analyzeRoutes from './routes/analyze';
 import preventionRoutes from './routes/prevention';
 import { authMiddleware } from './utils/jwt';
-dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
