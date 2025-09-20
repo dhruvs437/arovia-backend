@@ -22,9 +22,14 @@ router.post('/', rateLimitMiddleware, async (req: any, res) => {
 
   const { userId, lifestyle, consentId, healthDatabases } = parsed.data;
 
-  // merge with latest health doc
-  const latest = await HealthRecord.findOne({ userId }).sort({ createdAt: -1 });
-  const merged = { payload: { ...(latest?.payload || {}), ...(lifestyle || {}) } };
+  // fetch recent health records (last 10)
+  const docs = await HealthRecord.find({ userId }).sort({ createdAt: -1 }).limit(10);
+
+  // Build merged payload: include both recentRecords and the incoming lifestyle
+  const merged = {
+    baselineRecords: docs.map(d => ({ source: d.source, payload: d.payload, createdAt: d.createdAt })),
+    lifestyle,
+  };
 
   // compute an input hash for auditability
   const ihash = inputHash(JSON.stringify(merged));

@@ -1,6 +1,9 @@
 // src/services/groqAdapter.ts
 import Groq from "groq-sdk";
 
+/**
+ * Groq client. Ensure process.env.GROQ_API_KEY is set in your .env for dev.
+ */
 const client = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
@@ -25,19 +28,23 @@ export function sanitizePayload(raw: any) {
 }
 
 /**
- * Ask Groq LLM to analyze merged data and return strictly formatted JSON.
- * healthDatabases: array of named health databases/resources (e.g. "NHANES", "PubMed", "WHO")
- * The model will indicate which of those named databases it uses to support claims, or "no citation available".
+ * analyzeWithGroq
  *
- * NOTE: The model does NOT fetch these databases in real time — they're guidance for the model's internal knowledge.
+ * This function asks the Groq LLM to analyze the mergedData. The important change:
+ * - mergedData is expected to include baselineRecords (an array of recent health records)
+ *   and lifestyle (the scenario to project).
+ * - The model is instructed to return JSON with `baseline`, `projection`, and `deltas`.
+ *
+ * The function is robust: it tries to parse direct JSON, extracts the first JSON object if the model emits extra text,
+ * and it ensures model_version + generated_on fields exist before returning.
  */
 export async function analyzeWithGroq({
   userId,
   mergedData,
   healthDatabases = ["NHANES", "PubMed", "WHO", "ADA", "AHA"],
-  model = process.env.GROQ_MODEL || "llama-3.2-70b-versatile",
+  model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
   max_tokens = 1200,
-  temperature = 0.7,
+  temperature = 0.0, // deterministic by default for analysis
 }: {
   userId: string;
   mergedData: any;
@@ -49,60 +56,66 @@ export async function analyzeWithGroq({
   const sanitized = sanitizePayload(mergedData);
 
   // System prompt: strong constraints and JSON-only output
-  const systemPrompt = `You are a medical-advice assistant for prototyping only (not a doctor).
-  You will be given anonymized patient data (labs, vitals, diagnoses, lifestyle).
-  Provide a concise JSON object with:
-  - 1-2 sentence summary,
-  - predicted conditions and timeline (years) with probability percentages,
-  - short rationale for each prediction,
-  - interventions (actionable lifestyle steps),
-  - top contributing features.
-  
-  Return valid JSON only. Do not include any free-form text outside the JSON.`;
+  const systemPrompt = `You are a medical analysis assistant for prototyping only (not a doctor).
+You will be given anonymized patient baselineRecords (labs, vitals, medications, diagnoses) and a scenario "lifestyle" describing the patient's lifestyle going forward.
+Produce strictly valid JSON only (no extra commentary).`;
 
-  // Full assistant_instructions JSON schema (strict)
-  const assistant_instructions = {
-    schema: {
-      model_version: "string",
-      generated_on: "string (ISO datetime)",
-      summary: "short string (<=2 sentences)",
-      predictions: [
-        {
-          condition: "string",
-          years: "number",
-          probability_pct: "number",
-          rationale: "string (1-2 sentences)",
-          preventable: "boolean",
-          interventions: ["string"],
-          citations: ["string (named database like 'NHANES' or 'PubMed' or 'no citation available')"]
-        }
-      ],
-      explainability: {
-        top_features: [
-          { feature: "string", impact: "number (positive increases risk, negative decreases)" }
-        ]
-      },
-      notes: "Return only JSON that validates against this schema. Do not include free-form text outside JSON."
-    },
-    notes:
-      "This JSON will be validated downstream. Return only JSON. Do not include additional commentary or markup."
-  };
-
-  // Build the user content payload the model will see
+  // Explicit schema instructions: require baseline + projection + deltas
+  // (We also accept legacy 'predictions' outputs — the caller will handle fallback.)
   const userContent = `
-Anonymized patient data (JSON):
+INPUT (anonymized):
 ${JSON.stringify(sanitized, null, 2)}
 
-Assistant instructions (JSON schema):
-${JSON.stringify(assistant_instructions, null, 2)}
+REQUIRED OUTPUT (JSON only) — must match this shape exactly (fields may be empty arrays where appropriate):
 
-Background guidance: ${healthDatabases.join(", ")}
-For each predicted condition, include supporting named database(s) from the list above or "no citation available".
-If uncertain, return probability_pct: -1 and citations: ["no citation available"] rather than fabricating values.
+{
+  "model_version": "string",
+  "generated_on": "ISO datetime string",
+  "summary": "short string (<=2 sentences)",
+  "baseline": {
+    "predictions": [
+      {
+        "condition": "string",
+        "years": number,
+        "probability_pct": number,
+        "rationale": "string",
+        "preventable": boolean,
+        "interventions": ["string"],
+        "citations": ["string"]
+      }
+    ]
+  },
+  "projection": {
+    "predictions": [ /* same shape as baseline.predictions */ ]
+  },
+  "deltas": [
+    {
+      "condition": "string",
+      "baseline_pct": number,
+      "projection_pct": number,
+      "delta_pct": number
+    }
+  ],
+  "explainability": {
+    "top_features": [
+      { "feature": "string", "impact": number }
+    ]
+  }
+}
+
+INSTRUCTIONS:
+- Use baselineRecords to compute the patient's current (baseline) risk per major condition (e.g., Type 2 Diabetes, Cardiovascular Disease, Kidney Disease).
+- Use the provided "lifestyle" object to compute a projected risk if that lifestyle continues.
+- For each condition present in baseline or projection produce a delta entry = projection_pct - baseline_pct (use -1 where unknown).
+- When citing evidence, pick named sources from this guidance list or use "no citation available" if unsure.
+Background guidance sources: ${healthDatabases.join(", ")}.
+
+If you are uncertain about numeric probabilities, set probability_pct to -1 and citations: ["no citation available"] rather than fabricating numbers.
+Return valid JSON only. Do not include any free-form text or explanation outside the JSON object.
 `;
 
   try {
-    // Call Groq API with chat completions
+    // Call Groq API — use chat completions when supported. response_format json_object helps the model produce JSON.
     const chatCompletion = await client.chat.completions.create({
       messages: [
         { role: "system", content: systemPrompt },
@@ -111,11 +124,12 @@ If uncertain, return probability_pct: -1 and citations: ["no citation available"
       model,
       max_tokens,
       temperature,
-      response_format: { type: "json_object" }, // Groq supports JSON mode for compatible models
+      // Groq's json_object mode will return pure JSON for compatible models; keep this but tolerate text outputs too.
+      response_format: { type: "json_object" },
     });
 
-    // Log usage for monitoring
-    const usage = chatCompletion.usage;
+    // Try to capture usage if returned (helpful for monitoring)
+    const usage = (chatCompletion as any).usage;
     if (usage) {
       console.log("Groq usage:", {
         prompt_tokens: usage.prompt_tokens,
@@ -124,19 +138,30 @@ If uncertain, return probability_pct: -1 and citations: ["no citation available"
       });
     }
 
-    // Extract the response content
-    const outputText = chatCompletion.choices[0]?.message?.content;
+    // Extract the raw content — different SDK versions may return different shapes.
+    // Some shapes: choices[0].message.content (string), or choices[0].message.content (object) if json_object mode applied.
+    const firstChoice = (chatCompletion as any).choices?.[0];
+    let outputContent = firstChoice?.message?.content ?? firstChoice?.message ?? null;
 
+    // If Groq returned a parsed JSON object directly (not a string), use it.
+    if (outputContent && typeof outputContent === "object" && !Array.isArray(outputContent)) {
+      const parsedObj = outputContent;
+      parsedObj.model_version = parsedObj.model_version || `${model}-v1`;
+      parsedObj.generated_on = parsedObj.generated_on || new Date().toISOString();
+      return parsedObj;
+    }
+
+    // Otherwise, treat outputContent as string
+    const outputText = typeof outputContent === "string" ? outputContent : null;
     if (!outputText) {
       throw new Error("Groq returned no textual output");
     }
 
-    // Attempt to parse JSON-only output
+    // Attempt to parse JSON directly, then fallback to extracting first JSON block
     let parsed: any;
     try {
       parsed = JSON.parse(outputText);
     } catch (err) {
-      // Attempt to extract the first JSON object in the text
       const jsonMatch = outputText.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         try {
@@ -149,44 +174,35 @@ If uncertain, return probability_pct: -1 and citations: ["no citation available"
       }
     }
 
-    // Ensure metadata fields exist
+    // Ensure metadata fields exist and return
     parsed.model_version = parsed.model_version || `${model}-v1`;
     parsed.generated_on = parsed.generated_on || new Date().toISOString();
 
     return parsed;
 
-  } catch (error) {
+  } catch (error: any) {
+    // Provide clearer error messages for common cases
     console.error("Groq API error:", error);
-    
-    // Handle rate limiting specifically
-    if (error instanceof Error && error.message.includes("rate limit")) {
-      throw new Error("Rate limit reached. Please try again in a moment.");
+
+    // rate-limit handling / insufficient access
+    const msg = (error?.message || "").toLowerCase();
+    if (msg.includes("rate limit") || msg.includes("quota")) {
+      throw new Error("Groq rate limit or quota error — try again later.");
     }
-    
+    if (msg.includes("model_not_found") || msg.includes("does not exist") || msg.includes("not supported")) {
+      throw new Error(`Model error from Groq: ${error.message}`);
+    }
+
+    // Re-throw original error if not a known transient case
     throw error;
   }
 }
 
 /**
- * Alternative models available on Groq (for different use cases):
- * 
- * Best for medical/general:
- * - "llama-3.2-70b-versatile" (recommended - best quality)
- * - "llama-3.2-8b-instant" (faster, lower quality)
- * 
- * Best for structured data/JSON:
- * - "mixtral-8x7b-32768" (good for JSON outputs)
- * 
- * Fastest inference:
- * - "llama-3.2-3b-preview" (ultra-fast, basic quality)
- * 
- * You can switch models based on your needs:
- * - Development/testing: use smaller models for speed
- * - Production: use larger models for quality
+ * GROQ_MODELS: recommended model constants you can import/use elsewhere.
  */
 export const GROQ_MODELS = {
-  BEST: "llama-3.2-70b-versatile",
-  FAST: "llama-3.2-8b-instant", 
-  ULTRA_FAST: "llama-3.2-3b-preview",
-  JSON_OPTIMIZED: "mixtral-8x7b-32768",
+  BEST: "llama-3.3-70b-versatile",       // high quality / large context
+  FAST: "llama-3.1-8b-instant",          // faster, cheaper
+  JSON_OPTIMIZED: "groq/compound-mini",  // if you want a JSON-focused model
 } as const;
